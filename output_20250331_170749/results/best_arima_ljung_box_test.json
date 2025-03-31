@@ -1,0 +1,26 @@
+[
+    {
+        "lag": 10,
+        "q_stat": 12.039244586605063,
+        "p_value": 0.28243859454797077,
+        "conclusion": "no autocorrelation"
+    },
+    {
+        "lag": 20,
+        "q_stat": 19.702597592666287,
+        "p_value": 0.47666645273554065,
+        "conclusion": "no autocorrelation"
+    },
+    {
+        "lag": 30,
+        "q_stat": 31.82533683339629,
+        "p_value": 0.37569456195011564,
+        "conclusion": "no autocorrelation"
+    },
+    {
+        "lag": 40,
+        "q_stat": 46.489690365982945,
+        "p_value": 0.22263078231911448,
+        "conclusion": "no autocorrelation"
+    }
+]

@@ -1,0 +1,68 @@
+{
+    "timestamp": "2025-03-31 17:08:41",
+    "store_id": 1,
+    "models": {
+        "ARIMA": {
+            "order": "(1,1,1)"
+        },
+        "Best_ARIMA": {
+            "order": "(0, 0, 3)"
+        },
+        "Best_SARIMA": {
+            "order": "(0, 0, 2)",
+            "seasonal_order": "(0, 1, 0, 52)"
+        },
+        "Ensemble": {
+            "models": [
+                "ARIMA",
+                "Best_ARIMA",
+                "Best_SARIMA"
+            ]
+        }
+    },
+    "performance": {
+        "ARIMA": {
+            "model_name": "arima",
+            "mae": 71750.98790806638,
+            "rmse": 79550.93074067715,
+            "mape": 4.6318293664375645,
+            "smape": 4.5995895699089395,
+            "wmape": 4.620537414845998
+        },
+        "Best_ARIMA": {
+            "model_name": "best_arima",
+            "mae": 69216.38048277056,
+            "rmse": 77515.90014257762,
+            "mape": 4.470585256291368,
+            "smape": 4.4385000216901425,
+            "wmape": 4.457316687411119
+        },
+        "Best_SARIMA": {
+            "model_name": "best_sarima",
+            "mae": 262198.71718497714,
+            "rmse": 385651.58509094204,
+            "mape": 17.367239671211536,
+            "smape": 15.323544910526104,
+            "wmape": 16.884770763436585
+        },
+        "Ensemble": {
+            "model_name": "ensemble",
+            "mae": 111703.48282913084,
+            "rmse": 149068.79738258122,
+            "mape": 7.3624436048351605,
+            "smape": 6.999392622786617,
+            "wmape": 7.193352131149991
+        }
+    },
+    "best_model": {
+        "name": "Best_ARIMA",
+        "metrics": {
+            "model_name": "best_arima",
+            "mae": 69216.38048277056,
+            "rmse": 77515.90014257762,
+            "mape": 4.470585256291368,
+            "smape": 4.4385000216901425,
+            "wmape": 4.457316687411119
+        }
+    }
+}

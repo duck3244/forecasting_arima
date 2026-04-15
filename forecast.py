@@ -4,172 +4,117 @@
 
 import os
 import json
+import logging
 import numpy as np
 import pandas as pd
+import joblib
 
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 
-from config import FORECAST_STEPS, OUTPUT_DIR
+from config import FORECAST_STEPS, OUTPUT_DIR, PI_ALPHA
+from data_handler import inverse_transform
+
+logger = logging.getLogger(__name__)
+
+
+def _forecast_with_ci(model, steps, exog=None, alpha=PI_ALPHA):
+    """
+    가능한 경우 get_forecast()로 점 예측과 신뢰구간을 함께 반환합니다.
+    실패 시 ARIMA(statsmodels)의 get_forecast도 지원하며, 최종 fallback은 점 예측만.
+    """
+    try:
+        gf = model.get_forecast(steps=steps, exog=exog)
+        mean = gf.predicted_mean
+        ci = gf.conf_int(alpha=alpha)
+        if isinstance(ci, pd.DataFrame):
+            lower = ci.iloc[:, 0]
+            upper = ci.iloc[:, 1]
+        else:
+            lower = pd.Series(ci[:, 0])
+            upper = pd.Series(ci[:, 1])
+        return mean, lower, upper
+    except Exception as e:
+        logger.warning(f"신뢰구간 계산 실패, 점 예측으로 대체: {e}")
+        mean = model.forecast(steps=steps, exog=exog)
+        nan_series = pd.Series([np.nan] * steps, index=getattr(mean, 'index', None))
+        return mean, nan_series, nan_series
 
 
 def ensemble_forecast(models, steps=FORECAST_STEPS, exog=None):
-    """
-    여러 모델의 예측을 결합합니다.
-    
-    Args:
-        models (list): 학습된 모델 리스트
-        steps (int): 예측 기간
-        exog (pandas.DataFrame, optional): 외생 변수 데이터
-        
-    Returns:
-        numpy.ndarray: 앙상블 예측 결과
-    """
-    forecasts = []
-
-    for model in models:
-        # 모델 예측 수행
-        forecast = model.forecast(steps=steps, exog=exog)
-        forecasts.append(forecast)
-
-    # 모든 예측값의 평균 계산
-    if forecasts:
-        # 모든 예측을 같은 형태로 변환
-        aligned_forecasts = []
-        for f in forecasts:
-            if isinstance(f, pd.Series):
-                aligned_forecasts.append(f.values)
-            else:
-                aligned_forecasts.append(f)
-
-        # 평균 계산
-        ensemble_result = np.mean(aligned_forecasts, axis=0)
-        return ensemble_result
-    else:
+    """여러 모델의 예측을 결합합니다."""
+    if not models:
         return None
+    aligned = []
+    for model in models:
+        f = model.forecast(steps=steps, exog=exog)
+        aligned.append(f.values if isinstance(f, pd.Series) else np.asarray(f))
+    return np.mean(aligned, axis=0)
 
 
-def predict_future(model, steps=FORECAST_STEPS, exog=None, series=None, store_data=None, transformed=False):
+def predict_future(model, steps=FORECAST_STEPS, exog=None, series=None,
+                   store_data=None, transformed=False):
     """
-    미래 값을 예측합니다.
-    
-    Args:
-        model: 학습된 모델
-        steps (int): 예측 기간
-        exog (pandas.DataFrame, optional): 외생 변수 데이터
-        series (pandas.Series): 원본 시계열 데이터 (인덱스 참조용)
-        store_data (pandas.DataFrame): 변환된 경우 역변환에 사용
-        transformed (bool): 변환 여부
-        
-    Returns:
-        tuple: (예측 결과, 예측 날짜)
+    미래 값을 예측하고 (예측값, 하한, 상한, 날짜)를 반환합니다.
     """
-    # 미래 예측
-    future_forecast = model.forecast(steps=steps, exog=exog)
-    
-    # 변환된 경우 역변환
-    if transformed and store_data is not None:
-        if (store_data['Weekly_Sales'] <= 0).any():
-            # log1p 변환을 사용한 경우
-            min_val = store_data['Weekly_Sales'].min()
-            future_forecast_orig = np.expm1(future_forecast) - abs(min_val) - 1
-        else:
-            # 일반 로그 변환을 사용한 경우
-            future_forecast_orig = np.exp(future_forecast)
-    else:
-        future_forecast_orig = future_forecast
-    
-    # 마지막 날짜 이후로 날짜 생성
-    if series is not None:
+    mean, lower, upper = _forecast_with_ci(model, steps, exog=exog)
+
+    future_mean = inverse_transform(mean, store_data, transformed) if transformed else mean
+    future_lower = inverse_transform(lower, store_data, transformed) if transformed else lower
+    future_upper = inverse_transform(upper, store_data, transformed) if transformed else upper
+
+    if series is not None and isinstance(series.index[-1], pd.Timestamp):
         last_date = series.index[-1]
-        if isinstance(last_date, pd.Timestamp):
-            # 주간 데이터로 가정
-            future_dates = pd.date_range(start=last_date + pd.Timedelta(days=7), periods=steps, freq='W')
-        else:
-            future_dates = range(len(series), len(series) + steps)
+        future_dates = pd.date_range(start=last_date + pd.Timedelta(days=7), periods=steps, freq='W')
     else:
         future_dates = range(steps)
-    
-    # 미래 예측 결과를 데이터프레임으로 변환
+
     future_df = pd.DataFrame({
         'Date': future_dates,
-        'Predicted_Sales': future_forecast_orig
+        'Predicted_Sales': np.asarray(future_mean),
+        'Lower_CI': np.asarray(future_lower),
+        'Upper_CI': np.asarray(future_upper),
     })
-    
-    # 결과 저장
+
     results_path = os.path.join(OUTPUT_DIR, 'results', 'future_predictions.csv')
     future_df.to_csv(results_path, index=False)
-    
-    # JSON 형식으로도 저장 (날짜 처리)
+
     json_data = []
-    for i, row in future_df.iterrows():
+    for _, row in future_df.iterrows():
         date_str = row['Date'].strftime('%Y-%m-%d') if isinstance(row['Date'], pd.Timestamp) else str(row['Date'])
         json_data.append({
             "date": date_str,
-            "prediction": float(row['Predicted_Sales'])
+            "prediction": float(row['Predicted_Sales']),
+            "lower_ci": float(row['Lower_CI']) if not np.isnan(row['Lower_CI']) else None,
+            "upper_ci": float(row['Upper_CI']) if not np.isnan(row['Upper_CI']) else None,
         })
-    
-    json_path = os.path.join(OUTPUT_DIR, 'results', 'future_predictions.json')
-    with open(json_path, 'w') as f:
+    with open(os.path.join(OUTPUT_DIR, 'results', 'future_predictions.json'), 'w') as f:
         json.dump(json_data, f, indent=4)
-    
-    return future_forecast_orig, future_dates
+
+    return np.asarray(future_mean), future_dates, np.asarray(future_lower), np.asarray(future_upper)
 
 
 def create_final_model(series, exog=None, order=(1, 1, 1), seasonal_order=(0, 0, 0, 12)):
-    """
-    최종 예측 모델을 생성합니다.
-    
-    Args:
-        series (pandas.Series): 시계열 데이터
-        exog (pandas.DataFrame, optional): 외생 변수 데이터
-        order (tuple): ARIMA 모델 차수 (p, d, q)
-        seasonal_order (tuple): 계절성 차수 (P, D, Q, s)
-        
-    Returns:
-        statsmodels 모델: 학습된 SARIMAX 모델
-    """
-    print("\n=== 최종 예측 모델 학습 ===")
-    
-    # SARIMAX 모델 학습
-    final_model = SARIMAX(
-        series,
-        exog=exog,
-        order=order,
-        seasonal_order=seasonal_order
-    ).fit(disp=False)
-    
-    print(f"최종 모델: SARIMAX{order}x{seasonal_order}")
-    print(final_model.summary())
-    
-    # 모델 저장
+    """최종 예측 모델을 생성합니다 (미래 예측 전용, 전체 데이터로 학습)."""
+    logger.info(f"최종 예측 모델 학습: SARIMAX{order}x{seasonal_order}")
+    final_model = SARIMAX(series, exog=exog, order=order, seasonal_order=seasonal_order).fit(disp=False)
+    logger.debug(final_model.summary())
+
     model_path = os.path.join(OUTPUT_DIR, 'models', 'final_model.pkl')
-    import joblib
     joblib.dump(final_model, model_path)
-    print(f"최종 모델 저장: {model_path}")
-    
+    logger.info(f"최종 모델 저장: {model_path}")
     return final_model
 
 
 def prepare_future_exog(exog, steps=FORECAST_STEPS):
     """
     미래 예측을 위한 외생 변수를 준비합니다.
-    
-    Args:
-        exog (pandas.DataFrame): 외생 변수 데이터
-        steps (int): 예측 기간
-        
-    Returns:
-        pandas.DataFrame: 미래 외생 변수
+
+    주의: 실제 운영 환경에서는 외생 변수의 미래값을 별도 예측하거나
+    기획된 값을 사용해야 합니다. 현재 구현은 마지막 N개 값을 그대로
+    재사용하는 단순한 플레이스홀더로, 해석 시 유의해야 합니다.
     """
     if exog is None:
         return None
-    
-    # 실제로는 미래 외생 변수 값을 적절히 예측해야 함
-    # 이 함수에서는 간단히 마지막 값들을 반복 사용
     future_exog = exog.iloc[-steps:].reset_index(drop=True)
-    
-    # 다른 방법: 시계열 예측 또는 평균 사용
-    # future_exog = pd.DataFrame({col: [exog[col].mean()] * steps for col in exog.columns})
-    
+    logger.warning("미래 외생변수는 마지막 구간을 복제 사용 중 (점진적 개선 필요)")
     return future_exog
-

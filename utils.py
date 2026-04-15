@@ -4,14 +4,76 @@
 
 import os
 import json
+import logging
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
 from datetime import datetime
 from statsmodels.tsa.seasonal import seasonal_decompose
+from statsmodels.tsa.stattools import acf
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 
-from config import OUTPUT_DIR, DPI
+from config import OUTPUT_DIR, DPI, EPSILON
+
+logger = logging.getLogger(__name__)
+
+
+def calculate_metrics(actual, predicted):
+    """
+    공통 예측 성능 지표 계산 헬퍼.
+
+    반환: dict(mae, rmse, mape, smape, wmape)
+    - mape: 실제값이 epsilon보다 큰 표본만 사용 (표본 수도 반환)
+    - wmape: 0값에 강건한 가중 절대 백분율 오차 (주 지표 권장)
+    """
+    actual = np.asarray(actual.values if hasattr(actual, 'values') else actual, dtype=float)
+    predicted = np.asarray(predicted.values if hasattr(predicted, 'values') else predicted, dtype=float)
+
+    mae = float(mean_absolute_error(actual, predicted))
+    rmse = float(np.sqrt(mean_squared_error(actual, predicted)))
+
+    non_zero = np.abs(actual) > EPSILON
+    mape = float('nan')
+    if np.any(non_zero):
+        mape = float(np.mean(np.abs((actual[non_zero] - predicted[non_zero]) / actual[non_zero])) * 100)
+
+    smape = float(np.mean(2.0 * np.abs(actual - predicted) /
+                          (np.abs(actual) + np.abs(predicted) + EPSILON)) * 100)
+    wmape = float(np.sum(np.abs(actual - predicted)) / (np.sum(np.abs(actual)) + EPSILON) * 100)
+
+    return {
+        'mae': mae,
+        'rmse': rmse,
+        'mape': mape if not np.isnan(mape) else None,
+        'smape': smape,
+        'wmape': wmape,
+        'n_mape_samples': int(non_zero.sum()),
+    }
+
+
+def detect_seasonal_period(series, candidates=(4, 7, 12, 24, 26, 52), min_obs_multiplier=2):
+    """
+    ACF 피크를 기준으로 계절성 주기를 자동 감지합니다.
+    - 후보 중 관측 수가 충분한(period * min_obs_multiplier 이상) 항목만 고려
+    - 후보 lag에서의 ACF 절대값이 가장 큰 주기를 반환
+    - 감지 실패 시 None
+    """
+    series = series.dropna()
+    n = len(series)
+    valid = [p for p in candidates if n >= p * min_obs_multiplier]
+    if not valid:
+        return None
+    max_lag = min(n - 1, max(valid) + 1)
+    try:
+        acf_vals = acf(series, nlags=max_lag, fft=True)
+    except Exception as e:
+        logger.warning(f"ACF 계산 실패, 계절성 자동 감지를 건너뜁니다: {e}")
+        return None
+    best = max(valid, key=lambda p: abs(acf_vals[p]))
+    if abs(acf_vals[best]) < 0.2:
+        return None
+    return best
 
 
 def save_summary_report(models_info, performance_results, store_id):
@@ -45,7 +107,7 @@ def save_summary_report(models_info, performance_results, store_id):
     with open(html_path, 'w') as f:
         f.write(html_report)
     
-    print(f"\n분석 보고서가 '{OUTPUT_DIR}/results/' 디렉토리에 저장되었습니다.")
+    logger.info(f"분석 보고서가 '{OUTPUT_DIR}/results/' 디렉토리에 저장되었습니다.")
 
 
 def get_best_model(performance_results):
@@ -59,9 +121,12 @@ def get_best_model(performance_results):
         dict: 최적 모델 정보
     """
     models = list(performance_results.keys())
-    
-    # RMSE 기준으로 최적 모델 선택
-    best_model = min(models, key=lambda x: performance_results[x]['rmse'])
+
+    # WMAPE 기준으로 최적 모델 선택 (0값에 강건)
+    def _score(name):
+        m = performance_results[name]
+        return m.get('wmape') if m.get('wmape') is not None else m['rmse']
+    best_model = min(models, key=_score)
     
     return {
         "name": best_model,
@@ -100,22 +165,24 @@ def create_html_report(report):
         <p><strong>생성 시간:</strong> {report['timestamp']}</p>
         <p><strong>대상 매장:</strong> Store {report['store_id']}</p>
         
-        <h2>최적 모델</h2>
+        <h2>최적 모델 (WMAPE 기준)</h2>
         <table>
             <tr>
                 <th>모델</th>
                 <th>MAE</th>
                 <th>RMSE</th>
                 <th>SMAPE</th>
+                <th>WMAPE</th>
             </tr>
             <tr class="best">
                 <td>{report['best_model']['name']}</td>
                 <td>{report['best_model']['metrics']['mae']:.2f}</td>
                 <td>{report['best_model']['metrics']['rmse']:.2f}</td>
                 <td>{report['best_model']['metrics']['smape']:.2f}%</td>
+                <td>{report['best_model']['metrics'].get('wmape', float('nan')):.2f}%</td>
             </tr>
         </table>
-        
+
         <h2>모델 성능 비교</h2>
         <table>
             <tr>
@@ -123,6 +190,7 @@ def create_html_report(report):
                 <th>MAE</th>
                 <th>RMSE</th>
                 <th>SMAPE</th>
+                <th>WMAPE</th>
             </tr>
     """
     
@@ -138,6 +206,7 @@ def create_html_report(report):
                 <td>{metrics['mae']:.2f}</td>
                 <td>{metrics['rmse']:.2f}</td>
                 <td>{metrics['smape']:.2f}%</td>
+                <td>{metrics.get('wmape', float('nan')):.2f}%</td>
             </tr>
         """
     

@@ -42,7 +42,7 @@ def plot_time_series(series, title="Timeseries data", xlabel="Time", ylabel="Val
     
     save_path = os.path.join(OUTPUT_DIR, 'figures', f'{filename}.png')
     plt.savefig(save_path, dpi=DPI)
-    plt.show()
+    plt.close()
 
 
 def plot_acf_pacf(series, lags=40, title="ACF & PACF"):
@@ -71,7 +71,7 @@ def plot_acf_pacf(series, lags=40, title="ACF & PACF"):
     filename = title.lower().replace(' ', '_')
     save_path = os.path.join(OUTPUT_DIR, 'figures', f'{filename}.png')
     plt.savefig(save_path, dpi=DPI)
-    plt.show()
+    plt.close()
 
 
 def plot_forecast(series, forecast, title="Forecast Timeseries", confidence_interval=None, model_name='model'):
@@ -122,10 +122,11 @@ def plot_forecast(series, forecast, title="Forecast Timeseries", confidence_inte
     filename = f'{model_name}_forecast'
     save_path = os.path.join(OUTPUT_DIR, 'figures', f'{filename}.png')
     plt.savefig(save_path, dpi=DPI)
-    plt.show()
+    plt.close()
 
 
-def plot_future_forecast(series, forecast, future_dates, title="Forecast", model_name='final_model'):
+def plot_future_forecast(series, forecast, future_dates, title="Forecast",
+                         model_name='final_model', lower=None, upper=None):
     """
     미래 예측 결과를 시각화합니다.
     
@@ -143,7 +144,15 @@ def plot_future_forecast(series, forecast, future_dates, title="Forecast", model
 
     # 미래 예측
     plt.plot(future_dates, forecast, label='Forecast', color='red', linestyle='--')
-    
+
+    # 신뢰 구간 음영
+    if lower is not None and upper is not None:
+        lower_arr = np.asarray(lower)
+        upper_arr = np.asarray(upper)
+        if not (np.all(np.isnan(lower_arr)) or np.all(np.isnan(upper_arr))):
+            plt.fill_between(future_dates, lower_arr, upper_arr,
+                             color='red', alpha=0.15, label='95% CI')
+
     # 그림자 강조 표시 (미래 영역)
     min_val = min(series.min(), forecast.min() if hasattr(forecast, 'min') else min(forecast))
     max_val = max(series.max(), forecast.max() if hasattr(forecast, 'max') else max(forecast))
@@ -163,7 +172,7 @@ def plot_future_forecast(series, forecast, future_dates, title="Forecast", model
     filename = f'{model_name}_future_forecast'
     save_path = os.path.join(OUTPUT_DIR, 'figures', f'{filename}.png')
     plt.savefig(save_path, dpi=DPI)
-    plt.show()
+    plt.close()
 
 
 def plot_seasonal_decomposition(result, title="Decomposition", model_name='decomposition'):
@@ -208,7 +217,7 @@ def plot_seasonal_decomposition(result, title="Decomposition", model_name='decom
     filename = f'{model_name}_decomposition'
     save_path = os.path.join(OUTPUT_DIR, 'figures', f'{filename}.png')
     plt.savefig(save_path, dpi=DPI)
-    plt.show()
+    plt.close()
 
 
 def plot_feature_importance(df, target='Weekly_Sales', top_n=10, title="Variable importance"):
@@ -221,8 +230,9 @@ def plot_feature_importance(df, target='Weekly_Sales', top_n=10, title="Variable
         top_n (int): 표시할 상위 변수 개수
         title (str): 그래프 제목
     """
+    import logging as _lg
     if target not in df.columns:
-        print(f"Warning: {target} column not found in DataFrame")
+        _lg.getLogger(__name__).warning(f"{target} column not found in DataFrame")
         return
     
     # 모든 수치형 변수에 대한 상관관계 계산
@@ -247,4 +257,4 @@ def plot_feature_importance(df, target='Weekly_Sales', top_n=10, title="Variable
     filename = 'feature_importance'
     save_path = os.path.join(OUTPUT_DIR, 'figures', f'{filename}.png')
     plt.savefig(save_path, dpi=DPI)
-    plt.show()
+    plt.close()

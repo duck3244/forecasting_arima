@@ -3,228 +3,189 @@
 """
 
 import os
+import logging
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from statsmodels.tsa.stattools import adfuller
+from statsmodels.tsa.stattools import adfuller, kpss
 
-from config import FIGURE_SIZE, DPI, OUTPUT_DIR
+from config import (
+    FIGURE_SIZE, DPI, OUTPUT_DIR,
+    OUTLIER_IQR_MULTIPLIER, EXOG_CORR_THRESHOLD, EXOG_NAN_RATIO_MAX,
+)
+
+logger = logging.getLogger(__name__)
 
 
 def load_data(file_path):
-    """
-    CSV 파일을 로드하고 기본 정보를 출력합니다.
-    
-    Args:
-        file_path (str): 데이터 파일 경로
-        
-    Returns:
-        pandas.DataFrame: 로드된 데이터프레임
-    """
+    """CSV 파일을 로드하고 기본 정보를 로그로 출력합니다."""
     df = pd.read_csv(file_path)
-    print(f"데이터 로드 완료: {df.shape[0]} 행, {df.shape[1]} 열")
+    logger.info(f"데이터 로드 완료: {df.shape[0]} 행, {df.shape[1]} 열")
     return df
 
 
-def preprocess_data(df):
+HOLIDAY_WEEKS = {
+    'Is_SuperBowl': {6},
+    'Is_LaborDay': {36},
+    'Is_Thanksgiving': {47},
+    'Is_Christmas': {51, 52},
+}
+
+
+def _add_holiday_dummies(df):
+    """
+    WeekOfYear를 이용해 소매 매출에 강하게 영향을 주는 주요 휴일을
+    0/1 더미로 생성합니다.
+    """
+    if 'WeekOfYear' not in df.columns:
+        logger.warning("WeekOfYear 컬럼이 없어 휴일 더미를 추가하지 못했습니다.")
+        return df
+    woy = df['WeekOfYear']
+    for name, weeks in HOLIDAY_WEEKS.items():
+        df[name] = woy.isin(weeks).astype(int)
+    logger.info(f"휴일 더미 추가: {list(HOLIDAY_WEEKS.keys())}")
+    return df
+
+
+def preprocess_data(df, apply_iqr_cap=False, add_holidays=True):
     """
     데이터 전처리를 수행합니다.
-    
+
     Args:
-        df (pandas.DataFrame): 원본 데이터프레임
-        
-    Returns:
-        pandas.DataFrame: 전처리된 데이터프레임
+        df: 원본 데이터프레임
+        apply_iqr_cap: True이면 Weekly_Sales에 IQR 캡핑 적용 (블랙프라이데이 등 중요
+            피크 신호를 지우므로 기본값은 False). 베이스라인 재현용 옵션.
+        add_holidays: 휴일 더미 컬럼 추가 여부.
     """
-    # 결측치 처리
     for col in df.select_dtypes(include=[np.number]).columns:
         if df[col].isnull().sum() > 0:
-            # 시계열 데이터는 보간법으로 채우는 것이 좋음
-            df[col] = df[col].interpolate(method='time')
-    
-    # 날짜 처리
+            df[col] = df[col].interpolate(method='linear')
+
     if 'Date' not in df.columns and 'Month' in df.columns and 'DayOfYear' in df.columns:
-        # 년도 정보가 없다면 2022년으로 가정
         df['Date'] = pd.to_datetime('2022-01-01') + pd.to_timedelta(df['DayOfYear'] - 1, unit='d')
-    
-    # 이상치 탐지 및 처리 (IQR 방법)
-    for col in ['Weekly_Sales']:
-        if col in df.columns:
-            Q1 = df[col].quantile(0.25)
-            Q3 = df[col].quantile(0.75)
-            IQR = Q3 - Q1
-            lower_bound = Q1 - 1.5 * IQR
-            upper_bound = Q3 + 1.5 * IQR
-            
-            # 이상치를 경계값으로 대체
-            df.loc[df[col] < lower_bound, col] = lower_bound
-            df.loc[df[col] > upper_bound, col] = upper_bound
-    
-    # 로그 변환 (양수 값에만 적용)
+
+    if apply_iqr_cap and 'Weekly_Sales' in df.columns:
+        q1 = df['Weekly_Sales'].quantile(0.25)
+        q3 = df['Weekly_Sales'].quantile(0.75)
+        iqr = q3 - q1
+        lower = q1 - OUTLIER_IQR_MULTIPLIER * iqr
+        upper = q3 + OUTLIER_IQR_MULTIPLIER * iqr
+        n_clip = ((df['Weekly_Sales'] < lower) | (df['Weekly_Sales'] > upper)).sum()
+        df.loc[df['Weekly_Sales'] < lower, 'Weekly_Sales'] = lower
+        df.loc[df['Weekly_Sales'] > upper, 'Weekly_Sales'] = upper
+        logger.info(f"IQR 캡핑 적용: {n_clip}개 관측치를 경계값으로 치환")
+
+    if add_holidays:
+        df = _add_holiday_dummies(df)
+
+    # 로그 변환
     if 'Weekly_Sales' in df.columns:
-        if (df['Weekly_Sales'] <= 0).any():
-            # 로그 변환 대신 박스-콕스 변환 또는 상수 추가 후 로그 변환
-            min_val = df['Weekly_Sales'].min()
-            if min_val <= 0:
-                df['Weekly_Sales_Transformed'] = np.log1p(df['Weekly_Sales'] + abs(min_val) + 1)
-                print("음수 또는 0 값이 포함되어 있어 log1p 변환을 적용했습니다.")
-            else:
-                df['Weekly_Sales_Transformed'] = np.log(df['Weekly_Sales'])
-                print("로그 변환을 적용했습니다.")
+        min_val = df['Weekly_Sales'].min()
+        if min_val <= 0:
+            df['Weekly_Sales_Transformed'] = np.log1p(df['Weekly_Sales'] + abs(min_val) + 1)
+            logger.info("음수/0 값이 포함되어 log1p 변환(오프셋)을 적용했습니다.")
         else:
             df['Weekly_Sales_Transformed'] = np.log(df['Weekly_Sales'])
-            print("로그 변환을 적용했습니다.")
-    
+            logger.info("로그 변환을 적용했습니다.")
+
     return df
 
 
 def select_exog_variables(df):
-    """
-    ARIMAX 모델에 사용할 외생 변수를 선택합니다.
-    
-    Args:
-        df (pandas.DataFrame): 데이터프레임
-        
-    Returns:
-        list: 선택된 외생 변수 리스트
-    """
-    potential_exog_vars = ['Temperature', 'Fuel_Price', 'CPI', 'Unemployment', 'MarkDown1', 'MarkDown2', 
-                          'MarkDown3', 'MarkDown4', 'MarkDown5']
-    
-    # 사용 가능한 변수만 필터링
-    exog_vars = [var for var in potential_exog_vars if var in df.columns]
-    
+    """ARIMAX 모델에 사용할 외생 변수를 선택합니다."""
+    potential = ['Temperature', 'Fuel_Price', 'CPI', 'Unemployment',
+                 'MarkDown1', 'MarkDown2', 'MarkDown3', 'MarkDown4', 'MarkDown5',
+                 'Is_SuperBowl', 'Is_LaborDay', 'Is_Thanksgiving', 'Is_Christmas']
+    exog_vars = [v for v in potential if v in df.columns]
+    forced_keep = {'Is_SuperBowl', 'Is_LaborDay', 'Is_Thanksgiving', 'Is_Christmas'}
+
     if exog_vars:
-        # 결측치가 많은 변수 제외
-        exog_vars = [var for var in exog_vars if df[var].isnull().sum() / len(df) < 0.1]
-        
-        # 상관관계 확인 (Weekly_Sales와 상관관계가 높은 변수만 선택)
+        exog_vars = [v for v in exog_vars if df[v].isnull().sum() / len(df) < EXOG_NAN_RATIO_MAX]
+
         if 'Weekly_Sales' in df.columns and exog_vars:
             correlations = df[exog_vars + ['Weekly_Sales']].corr()['Weekly_Sales'].abs().sort_values(ascending=False)
-            print("\n외생 변수와 Weekly_Sales의 상관관계:")
-            print(correlations)
-            
-            # 시각화 - 상관관계 히트맵
+            logger.info(f"외생 변수와 Weekly_Sales의 상관관계:\n{correlations}")
+
             plt.figure(figsize=FIGURE_SIZE)
             corr_matrix = df[exog_vars + ['Weekly_Sales']].corr()
             plt.imshow(corr_matrix, cmap='coolwarm', interpolation='none', aspect='auto')
             plt.colorbar()
             plt.xticks(range(len(corr_matrix.columns)), corr_matrix.columns, rotation=45)
             plt.yticks(range(len(corr_matrix.columns)), corr_matrix.columns)
-            
-            # 히트맵에 상관계수 표시
             for i in range(len(corr_matrix.columns)):
                 for j in range(len(corr_matrix.columns)):
-                    text = plt.text(j, i, f'{corr_matrix.iloc[i, j]:.2f}',
-                                   ha="center", va="center", color="black")
-            
+                    plt.text(j, i, f'{corr_matrix.iloc[i, j]:.2f}', ha="center", va="center", color="black")
             plt.title('Heatmap of correlations between variables')
             plt.tight_layout()
-            
-            # 그림 저장
-            save_path = os.path.join(OUTPUT_DIR, 'figures', 'correlation_heatmap.png')
-            plt.savefig(save_path, dpi=DPI)
+            plt.savefig(os.path.join(OUTPUT_DIR, 'figures', 'correlation_heatmap.png'), dpi=DPI)
             plt.close()
-            
-            # 상관관계가 0.1 이상인 변수만 선택
-            exog_vars = [var for var in exog_vars if abs(correlations[var]) >= 0.1]
-    
-    print(f"\n선택된 외생 변수: {exog_vars}")
+
+            # 휴일 더미는 상관관계가 낮아도 도메인 지식상 유지 (희귀 이벤트)
+            exog_vars = [v for v in exog_vars
+                         if v in forced_keep or abs(correlations[v]) >= EXOG_CORR_THRESHOLD]
+
+    logger.info(f"선택된 외생 변수: {exog_vars}")
     return exog_vars
 
 
 def check_stationarity(series):
     """
-    시계열 데이터의 정상성을 검사합니다.
-    
-    Args:
-        series (pandas.Series): 시계열 데이터
-        
-    Returns:
-        bool: 정상성 여부 (True/False)
+    ADF + KPSS 합의 기반 정상성 판정.
+    - ADF H0: 단위근 있음(비정상). p<=0.05 → 정상
+    - KPSS H0: 정상. p>0.05 → 정상
+    - 두 검정이 모두 정상일 때만 정상으로 판정
     """
-    result = adfuller(series.dropna())
-    print("\n=== ADF 테스트 결과 ===")
-    print(f'ADF 통계량: {result[0]}')
-    print(f'p-value: {result[1]}')
-    print('임계값:')
-    for key, value in result[4].items():
-        print(f'\t{key}: {value}')
-    
-    # p-value가 0.05보다 작으면 정상성을 가진다고 판단
-    if result[1] <= 0.05:
-        print("결론: 정상 시계열 (차분이 필요하지 않음)")
-        return True
-    else:
-        print("결론: 비정상 시계열 (차분이 필요함)")
-        return False
+    series = series.dropna()
+    adf_stat, adf_p, *_ = adfuller(series)
+    adf_stationary = adf_p <= 0.05
+    logger.info(f"ADF stat={adf_stat:.4f}, p={adf_p:.4f} → {'정상' if adf_stationary else '비정상'}")
+
+    kpss_stationary = True
+    try:
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            kpss_stat, kpss_p, *_ = kpss(series, regression='c', nlags='auto')
+        kpss_stationary = kpss_p > 0.05
+        logger.info(f"KPSS stat={kpss_stat:.4f}, p={kpss_p:.4f} → {'정상' if kpss_stationary else '비정상'}")
+    except Exception as e:
+        logger.warning(f"KPSS 검정 실패: {e}")
+
+    is_stationary = adf_stationary and kpss_stationary
+    logger.info(f"정상성 합의 판정: {is_stationary}")
+    return is_stationary
 
 
 def prepare_train_test_split(series, exog=None, test_size=12):
-    """
-    시계열 데이터를 훈련 세트와 테스트 세트로 분할합니다.
-    
-    Args:
-        series (pandas.Series): 시계열 데이터
-        exog (pandas.DataFrame, optional): 외생 변수 데이터
-        test_size (int, optional): 테스트 세트 크기
-        
-    Returns:
-        tuple: (train, test, train_exog, test_exog)
-    """
+    """시계열 데이터를 훈련/테스트로 분할."""
+    if test_size <= 0 or test_size >= len(series):
+        raise ValueError(f"유효하지 않은 test_size={test_size} (series len={len(series)})")
     train_size = len(series) - test_size
-    train = series[:train_size]
-    test = series[train_size:]
-    
-    train_exog = None
-    test_exog = None
-    
+    train = series.iloc[:train_size]
+    test = series.iloc[train_size:]
+
+    train_exog = test_exog = None
     if exog is not None:
-        train_exog = exog[:train_size]
-        test_exog = exog[train_size:]
-    
+        train_exog = exog.iloc[:train_size]
+        test_exog = exog.iloc[train_size:]
+
     return train, test, train_exog, test_exog
 
 
 def inverse_transform(values, store_data, transformed=True):
-    """
-    변환된 데이터를 원래 스케일로 되돌립니다.
-    
-    Args:
-        values: 변환할 값(들)
-        store_data (pandas.DataFrame): 원본 데이터
-        transformed (bool): 변환 여부
-        
-    Returns:
-        변환된 값(들)
-    """
+    """변환된 예측값을 원 스케일로 역변환."""
     if not transformed:
         return values
-    
+
     if (store_data['Weekly_Sales'] <= 0).any():
-        # log1p 변환을 사용한 경우
         min_val = store_data['Weekly_Sales'].min()
         return np.expm1(values) - abs(min_val) - 1
-    else:
-        # 일반 로그 변환을 사용한 경우
-        return np.exp(values)
+    return np.exp(values)
 
 
 def get_future_dates(last_date, steps=12):
-    """
-    마지막 날짜 이후로 미래 날짜를 생성합니다.
-    
-    Args:
-        last_date: 마지막 날짜
-        steps (int): 생성할 날짜 수
-        
-    Returns:
-        pandas.DatetimeIndex: 미래 날짜
-    """
+    """마지막 날짜 이후 미래 날짜 생성."""
     if isinstance(last_date, pd.Timestamp):
-        # 주간 데이터로 가정
         return pd.date_range(start=last_date + pd.Timedelta(days=7), periods=steps, freq='W')
-    else:
-        return range(len(last_date), len(last_date) + steps)
-
+    return range(steps)
